@@ -48,7 +48,6 @@
 #include "anynet.hpp"
 #include "dragonfly.hpp"
 #include "gpunet.hpp"
-#include "fullyconnectedgpu.hpp"
 
 
 Network::Network( const Configuration &config, const string & name ) :
