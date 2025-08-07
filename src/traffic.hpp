@@ -171,4 +171,23 @@ public:
   virtual int dest(int source);
 };
 
+class GPUTrafficPattern : public TrafficPattern {
+private:
+  vector<int> _ratio;
+  vector<int> _total_units;
+  vector<int> _offsets;
+  int _l;
+  bool _partition;
+  int _nodes_sm;
+  int _nodes_l2slice;
+  int _l2slice_p;
+  vector<int> _part_for_sm; // Partition for each SM
+public:
+  GPUTrafficPattern(int nodes, Configuration const * const config);
+  virtual int dest(int source);
+  inline int GetNodesSM() const { return _nodes_sm; }
+  inline int GetNodesL2Slice() const { return _nodes_l2slice; }
+  inline int GetL2SliceP() const { return _l2slice_p; }
+  inline int GetPartitionForSM(int sm) const { return _part_for_sm[sm]; }
+};
 #endif

@@ -38,6 +38,7 @@
 #define _CHANNEL_HPP
 
 #include <queue>
+#include <deque>
 #include <cassert>
 
 #include "globals.hpp"
@@ -55,7 +56,9 @@ public:
   // Physical Parameters
   void SetLatency(int cycles);
   int GetLatency() const { return _delay ; }
-  
+  void SetBandwidth(int bandwidth);
+  int GetBandwidth() const { return _bandwidth; }
+
   // Send data 
   virtual void Send(T * data);
   
@@ -68,15 +71,17 @@ public:
 
 protected:
   int _delay;
-  T * _input;
-  T * _output;
-  queue<pair<int, T *> > _wait_queue;
+  // # flits that can be trasmitted in a single cycle
+  int _bandwidth;
+  deque<T *> _input;
+  deque<T *> _output;
+  queue<pair<int, deque<T *> > > _wait_queue;
 
 };
 
 template<typename T>
 Channel<T>::Channel(Module * parent, string const & name)
-  : TimedModule(parent, name), _delay(1), _input(0), _output(0) {
+  : TimedModule(parent, name), _delay(1), _bandwidth(1), _input(0), _output(0) {
 }
 
 template<typename T>
@@ -88,37 +93,52 @@ void Channel<T>::SetLatency(int cycles) {
 }
 
 template<typename T>
+void Channel<T>::SetBandwidth(int bandwidth) {
+  if (bandwidth < 0) {
+    Error("Channel bandwidth must be positive");
+  }
+  _bandwidth = bandwidth;
+}
+
+template<typename T>
 void Channel<T>::Send(T * data) {
-  _input = data;
+  if (data) {
+    _input.push_back(data);
+  }
 }
 
 template<typename T>
 T * Channel<T>::Receive() {
-  return _output;
+  if (_output.empty()) {
+    return nullptr;
+  }
+  T * data = _output.front();
+  _output.pop_front();
+  return data;
 }
 
 template<typename T>
 void Channel<T>::ReadInputs() {
-  if(_input) {
+  if(!_input.empty()) {
     _wait_queue.push(make_pair(GetSimTime() + _delay - 1, _input));
-    _input = 0;
+    _input.clear();
   }
 }
 
 template<typename T>
 void Channel<T>::WriteOutputs() {
-  _output = 0;
+  _output.clear();
   if(_wait_queue.empty()) {
     return;
   }
-  pair<int, T *> const & item = _wait_queue.front();
+  pair<int, deque<T *> > const & item = _wait_queue.front();
   int const & time = item.first;
   if(GetSimTime() < time) {
     return;
   }
   assert(GetSimTime() == time);
   _output = item.second;
-  assert(_output);
+  assert(!_output.empty());
   _wait_queue.pop();
 }
 

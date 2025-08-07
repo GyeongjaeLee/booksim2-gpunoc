@@ -48,8 +48,9 @@
 #include "buffer_monitor.hpp"
 
 IQRouter::IQRouter( Configuration const & config, Module *parent, 
-		    string const & name, int id, int inputs, int outputs )
-: Router( config, parent, name, id, inputs, outputs ), _active(false)
+		    string const & name, int id, int inputs, int outputs,
+        vector<int> const & input_bandwidths, vector<int> const & output_bandwidths )
+: Router( config, parent, name, id, inputs, outputs, input_bandwidths, output_bandwidths ), _active(false)
 {
   _vcs         = config.GetInt( "num_vcs" );
 
@@ -80,9 +81,36 @@ IQRouter::IQRouter( Configuration const & config, Module *parent,
   }
   _rf = rf_iter->second;
 
+  // Bandwidth Configuration
+  if(!_input_bandwidths.empty()) {
+    for(vector<int>::const_iterator iter = _input_bandwidths.begin();
+        iter != _input_bandwidths.end(); ++iter) {
+      if(*iter <= 0) {
+        Error("Bandwidth should be positive integer");
+      }
+    }
+  }
+
+  if(!_output_bandwidths.empty()) {
+    for(vector<int>::const_iterator iter = _output_bandwidths.begin();
+        iter != _output_bandwidths.end(); ++iter) {
+      if(*iter <= 0) {
+        Error("Bandwidth should be positive integer");
+      }
+    }
+  }
+
+  // for simple simulation, set uniform bandwidth for every input/output port
+  int temp_input_bw = !_input_bandwidths.empty() ? _input_bandwidths[0] : 1;
+  int temp_output_bw = !_output_bandwidths.empty() ? _output_bandwidths[0] : 1;
+  _input_speedup *= temp_input_bw;
+  _output_speedup *= temp_output_bw;
+
+  int bandwidth = 1;
   // Alloc VC's
   _buf.resize(_inputs);
   for ( int i = 0; i < _inputs; ++i ) {
+    // bandwidth = !_input_bandwidths.empty() ? _input_bandwidths[i] : 1;
     ostringstream module_name;
     module_name << "buf_" << i;
     _buf[i] = new Buffer(config, _outputs, this, module_name.str( ) );
@@ -297,21 +325,25 @@ bool IQRouter::_ReceiveFlits( )
 {
   bool activity = false;
   for(int input = 0; input < _inputs; ++input) { 
-    Flit * const f = _input_channels[input]->Receive();
-    if(f) {
+    FlitChannel * channel = _input_channels[input];
+    int bandwidth = channel->GetBandwidth();
+    for (int i = 0; i < bandwidth; ++i) {
+      Flit * const f = channel->Receive();
+      if(f) {
 
 #ifdef TRACK_FLOWS
-      ++_received_flits[f->cl][input];
+        ++_received_flits[f->cl][input];
 #endif
 
-      if(f->watch) {
-	*gWatchOut << GetSimTime() << " | " << FullName() << " | "
-		   << "Received flit " << f->id
-		   << " from channel at input " << input
-		   << "." << endl;
+        if(f->watch) {
+    *gWatchOut << GetSimTime() << " | " << FullName() << " | "
+        << "Received flit " << f->id
+        << " from channel at input " << input
+        << "." << endl;
+        }
+        _in_queue_flits.insert(make_pair(input, f));
+        activity = true;
       }
-      _in_queue_flits.insert(make_pair(input, f));
-      activity = true;
     }
   }
   return activity;
@@ -338,7 +370,7 @@ bool IQRouter::_ReceiveCredits( )
 
 void IQRouter::_InputQueuing( )
 {
-  for(map<int, Flit *>::const_iterator iter = _in_queue_flits.begin();
+  for(multimap<int, Flit *>::const_iterator iter = _in_queue_flits.begin();
       iter != _in_queue_flits.end();
       ++iter) {
 
@@ -606,6 +638,7 @@ void IQRouter::_VCAllocEvaluate( )
 	++iset) {
 
       int const out_port = iset->output_port;
+      // cout << "router id: " << _id << " out_port: " << out_port << " _outputs: " << _outputs << endl;
       assert((out_port >= 0) && (out_port < _outputs));
 
       BufferState const * const dest_buf = _next_buf[out_port];
@@ -698,6 +731,7 @@ void IQRouter::_VCAllocEvaluate( )
     _vc_allocator->PrintRequests( gWatchOut );
   }
 
+  // Revisit!!
   _vc_allocator->Allocate();
 
   if(watched) {
@@ -2239,24 +2273,28 @@ void IQRouter::_OutputQueuing( )
 void IQRouter::_SendFlits( )
 {
   for ( int output = 0; output < _outputs; ++output ) {
-    if ( !_output_buffer[output].empty( ) ) {
-      Flit * const f = _output_buffer[output].front( );
-      assert(f);
-      _output_buffer[output].pop( );
+    FlitChannel * channel = _output_channels[output];
+    int bandwidth = channel->GetBandwidth();
+    for (int i = 0; i < bandwidth; ++i) {
+      if ( !_output_buffer[output].empty( ) ) {
+        Flit * const f = _output_buffer[output].front( );
+        assert(f);
+        _output_buffer[output].pop( );
 
-#ifdef TRACK_FLOWS
-      ++_sent_flits[f->cl][output];
-#endif
+  #ifdef TRACK_FLOWS
+        ++_sent_flits[f->cl][output];
+  #endif
 
-      if(f->watch)
-	*gWatchOut << GetSimTime() << " | " << FullName() << " | "
-		    << "Sending flit " << f->id
-		    << " to channel at output " << output
-		    << "." << endl;
-      if(gTrace) {
-	cout << "Outport " << output << endl << "Stop Mark" << endl;
+        if(f->watch)
+    *gWatchOut << GetSimTime() << " | " << FullName() << " | "
+          << "Sending flit " << f->id
+          << " to channel at output " << output
+          << "." << endl;
+        if(gTrace) {
+    cout << "Outport " << output << endl << "Stop Mark" << endl;
+        }
+        _output_channels[output]->Send( f );
       }
-      _output_channels[output]->Send( f );
     }
   }
 }

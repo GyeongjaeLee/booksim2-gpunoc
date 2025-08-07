@@ -536,7 +536,7 @@ void BufferState::SimpleFeedbackSharedBufferPolicy::FreeSlotFor(int vc)
   SharedBufferPolicy::FreeSlotFor(vc);
 }
 
-BufferState::BufferState( const Configuration& config, Module *parent, const string& name ) : 
+BufferState::BufferState( const Configuration& config, Module *parent, const string& name, int bandwidth ) : 
   Module( parent, name ), _occupancy(0)
 {
   _vcs = config.GetInt( "num_vcs" );

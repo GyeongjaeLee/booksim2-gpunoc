@@ -34,7 +34,9 @@
 class Credit {
 
 public:
-
+  // 하나의 channel에 존재하는 모든 vc들에 해당하는 credit을 한번에 보냄
+  // 한 vc에서 여러 buffer가 자리가 생겼을 때는
+  // map으로 정확히 available해진 buffer 수를 나타내야할듯?!
   set<int> vc;
 
   // these are only used by the event router
