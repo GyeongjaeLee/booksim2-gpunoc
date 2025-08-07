@@ -5,649 +5,497 @@
 
 #include "gpunet.hpp"
 #include "misc_utils.hpp"
+#include "globals.hpp"
+
+int gX; // # of partition crossbars
+vector<int> gU; // units per layer
 
 GPUNet::GPUNet( const Configuration& config, const string & name )
 : Network ( config, name )
 {
-  _ComputeSize( config );
-  _Alloc( );
-  _BuildNet( config );
+  _ComputeSize(config);
+  _Alloc();
+  _BuildNet(config);
 }
 
-void GPUNet::_ComputeSize( const Configuration& config)
+void GPUNet::_ComputeSize( const Configuration& config )
 {
-  _use_cpc = (config.GetInt( "use_cpc") == 1);
-  _use_partition = (config.GetInt( "use_partition") == 1);
-  _use_dsmem = (config.GetInt( "use_dsmem") == 1);
+  // Number of layers
+  _l = config.GetInt("l");
+  _partition = (config.GetInt("partition") == 1);
+  
+  // Nodes (SM and L2 slices)
+  _nodes_sm = config.GetInt("sm");
+  _nodes_l2slice = config.GetInt("l2slice");
+  
+  _nodes = _nodes_sm + _nodes_l2slice;
 
-  _num_sms = config.GetInt( "sm" );
-  _num_tpcs = config.GetInt( "tpc" );
-  _num_cpcs = _use_cpc ? config.GetInt( "cpc" ) : 0;
-  _num_gpcs = config.GetInt( "gpc" );
-  _num_partitions = _use_partition ? config.GetInt( "partition" ) : 1;
-  _num_l2groups = config.GetInt( "l2group" );
-  _num_l2slices = config.GetInt( "l2slices" );
-
-  _tpc_speedup = config.GetInt( "tpc_speedup" );
-  _cpc_speedup = _use_cpc ? config.GetInt( "cpc_speedup" ) : _tpc_speedup;
-  _gpc_speedup = config.GetInt( "gpc_speedup" );
-  _inter_partition_speedup = config.GetInt( "interpartition_speedup" );
-  _l2group_speedup = config.GetInt( "l2group_speedup" );
-
-  // # routers used for a SM-to-L2 network
-  _num_sm_to_l2 = _num_sms + _num_tpcs + _num_cpcs + _num_gpcs
-                + _num_partitions + _num_l2groups + _num_l2slices;
-  // # routers used for a SM-to-SM network if _use_dsmsm is set
-  _num_sm_to_sm = _use_dsmem ? _num_tpcs + _num_cpcs + _num_gpcs : 0;  // crossbars
-
-  _sms_per_tpc = _num_sms / _num_tpcs;
-  if (_use_cpc) {
-    _tpcs_per_cpc = _num_tpcs / _num_cpcs;
-    _xpcs_per_gpc = _num_cpcs / _num_gpcs;
-  } else
-    _xpcs_per_gpc = _num_tpcs / _num_gpcs;
-  _gpcs_per_partition = _num_gpcs / _num_partitions;
-  _l2groups_per_partition = _num_l2groups / _num_partitions;
-  _l2slices_per_l2group = _num_l2slices / _num_l2groups;
-
-  // how to deal with dsmem inject/eject channels?
-  _nodes = _num_sms + _num_l2slices; 
-
-  _size = _num_sm_to_l2 + _num_sm_to_sm;
-
-  _channels_sm_to_l2 = 2 * (_num_sms + _num_tpcs
-           + _num_cpcs + _num_gpcs)                     // up/down across hierarchy
-           + _num_partitions * (_num_partitions - 1)    // inter-partition
-           + 2 * (_num_l2groups + _num_l2slices);
-
-  _channels_sm_to_sm = _use_dsmem ? 
-           2 * (_num_sms + _num_tpcs + _num_cpcs) : 0;
-
-  _channels = _channels_sm_to_l2 + _channels_sm_to_sm;
-
-  _l2slice_coords.resize(_num_l2slices);
-  for ( int i = 0; i < _num_l2slices; ++i ) {
-    // need to revisit
-    _l2slice_coords[i] = make_pair(i % 8, i / 8);
+  _ratio = config.GetIntArray("units");
+  if (_ratio.empty() || (_ratio.size() < size_t(_l))) {
+    _ratio.resize(_l, 1);
+  }
+  
+  _total_units.resize(_l);
+  for (int l = 0; l < _l; ++l) {
+    if (l == 0)
+      _total_units[l] = _nodes_sm / _ratio[l];
+    else
+      _total_units[l] = _total_units[l - 1] / _ratio[l];
   }
 
-  _n = config.GetInt( "n" );
-  _k = config.GetInt( "k" );
-  
-  gN = _n;
-  gK = _k;
+  _offsets.resize(_l, 0);
+  for (int l = 1; l < _l; ++l) {
+    _offsets[l] = _total_units[l - 1] + _offsets[l - 1];
+  }
+
+  // Routers for SM-to-L2 Request and Reply Network
+  _size = 0;
+  for (int l = 0; l < _l; l++) {
+    _size += 2 * _total_units[l];
+  }
+
+  // Channels for SM-to-L2 Network
+  _channels = 0;
+  for (int l = 0; l < _l; l++) {
+    if (l < _l - 1) {
+      _channels += 2 * _total_units[l];
+    } else {
+      // Fully-connected partitioned crossbars
+      _p = _partition ? _total_units[l] : 1;
+      _channels += 2 * _p * (_p - 1);
+    }
+  }
+
+  _l2slice_p = _nodes_l2slice / _p; // L2 slices per partition
+
+  _speedups = config.GetIntArray("speedups");
+  if (_speedups.empty() || (_speedups.size() < size_t(_l + 1))) {
+    _speedups.resize(_l + 1, 1);
+  }
+
+  _inter_partition_speedup = config.GetInt("inter_partition_speedup");
+
+#ifdef GPUNET_DEBUG
+  cout << "GPUNet Configuration:" << endl;
+  cout << "  l: " << _l << endl;
+  cout << "  nodes_sm: " << _nodes_sm << endl;
+  cout << "  nodes_l2slice: " << _nodes_l2slice << endl;
+  cout << "  ratio: ";
+  for (const auto& r : _ratio) {
+    cout << " " << r;
+  }
+  cout << endl;
+  cout << "  total_units: ";
+  for (const auto& u : _total_units) {
+    cout << " " << u;
+  }
+  cout << endl;
+  cout << "  offsets: ";
+  for (const auto& o : _offsets) {
+    cout << " " << o;
+  }
+  cout << endl;
+  cout << "  size: " << _size << endl;
+  cout << "  channels: " << _channels << endl;
+  cout << "  l2slice_p: " << _l2slice_p << endl;
+  cout << "  speedups: ";
+  for (const auto& s : _speedups) {
+    cout << " " << s;
+  }
+  cout << endl;
+  cout << "  inter_partition_speedup: " << _inter_partition_speedup << endl;
+#endif
+
+  gN = _l;
+  gX = _p;
+  gU = _ratio;
 }
 
-void GPUNet::_BuildNet( const Configuration& config)
+void GPUNet::_BuildNet(const Configuration& config)
 {
   ostringstream name;
-  int id, latency;
-  int layer = 0;
+  int c, id;
 
-  //
-  // Allocate SM-to-L2 Network's Routers
-  //
-  // SM routers (router_sm_sm)
-  for ( int sm = 0; sm < _num_sms; ++sm) {
-    name.str("");
-    name << "router_sm_" << sm;
-    id = _GetRouterIndex( layer, sm, false );
-    _routers[id] = Router::NewRouter( config, this, name.str( ),
-             id, _use_dsmem ? 3 : 2, _use_dsmem ? 3 : 2);
-    _timed_modules.push_back(_routers[id]);
-  }
-  layer++;
+  // STEP 1: Create all routers first
+  for (int l = 0; l < _l; ++l) {
+    for (int addr = 0; addr < _total_units[l]; ++addr) {
+      id = _offsets[l] + addr;
+      
+      int bottom_ports = (l < _l - 1) ? _ratio[l] : (_ratio[l] + (_p - 1));
+      int top_ports = (l < _l - 1) ? 1 : (_l2slice_p + (_p - 1));
 
-  // TPC routers (router_g_c_t)
-  for ( int t = 0; t < _num_tpcs; ++t ) {
-    int g = t / (_num_tpcs / _num_gpcs);
-    name.str("");
-    name << "router_" << g << "_";
-    if (_use_cpc) {
-      int c = t / (_num_tpcs / _num_cpcs);
-      name << c << "_";
-    }
-    name << "t";
-    id = _GetRouterIndex( layer, t, false );
-    _routers[id] = Router::NewRouter( config, this, name.str( ),
-             id, _sms_per_tpc + 1, _sms_per_tpc + 1);
-    _timed_modules.push_back(_routers[id]);
-  }
-  layer++;
-
-  // CPC routers (router_g_c)
-  if (_use_cpc) {
-    for ( int c = 0; c < _num_cpcs; ++c ) {
-      int g = c / (_num_cpcs / _num_gpcs);
       name.str("");
-      name << "router_" << g << "_" << c;
-      id = _GetRouterIndex( layer, c, false );
-      _routers[id] = Router::NewRouter( config, this, name.str( ),
-               id, _tpcs_per_cpc + 1, _tpcs_per_cpc + 1);
+      name << "router_" << "request" << "_" << l << "_" << addr;
+      _routers[id] = Router::NewRouter(config, this, name.str(), id, bottom_ports, top_ports);
       _timed_modules.push_back(_routers[id]);
-    }
-    layer++;
-  }
 
-  // GPC routers (router_g)
-  for ( int g = 0; g < _num_gpcs; ++g ) {
-    name.str("");
-    name << "router_" << g;
-    id = _GetRouterIndex( layer, g, false );
-    _routers[id] = Router::NewRouter( config, this, name.str( ),
-             id, _xpcs_per_gpc + 1, _xpcs_per_gpc + 1);
-    _timed_modules.push_back(_routers[id]);
-  }
-  layer++;
-
-  // Crossbars for each partition (router_crossbar_p)
-  for ( int p = 0; p < _num_partitions; ++p) {
-    name.str("");
-    name << "router_crossbar_" << p;
-    id = _GetRouterIndex( layer, p, false );
-    int inter_partition = (_use_partition && _num_partitions > 1) ? _num_partitions -1 : 0;
-    _routers[id] = Router::NewRouter( config, this, name.str( ), id,
-             _gpcs_per_partition + _l2groups_per_partition + inter_partition,
-             _gpcs_per_partition + _l2groups_per_partition + inter_partition);
-    _timed_modules.push_back(_routers[id]);
-  }
-  layer++;
-
-  // L2 groups routers (router_l2_l2g)
-  for ( int l2g = 0; l2g < _num_l2groups; ++l2g ) {
-    name.str("");
-    name << "router_l2_" << l2g;
-    id = _GetRouterIndex( layer, l2g, false );
-    _routers[id] = Router::NewRouter( config, this, name.str( ),
-             id, _l2slices_per_l2group + 1, _l2slices_per_l2group + 1);
-    _timed_modules.push_back(_routers[id]);
-  }
-  layer++;
-
-  // L2 slice routers (router_l2_l2g_l2s)
-  for ( int l2 = 0; l2 < _num_l2slices; ++l2 ) {
-    int l2g = l2 / _l2slices_per_l2group;
-    name.str("");
-    name << "router_l2_" << l2g << "_" << l2;
-    id = _GetRouterIndex( layer, l2, false );
-    _routers[id] = Router::NewRouter( config, this, name.str( ),
-             id, 2, 2);
-    _timed_modules.push_back(_routers[id]);
-  }
-
-  layer = 1;
-  //
-  // Allocate SM-to-SM Network's Routers
-  //
-  if (_use_dsmem) {
-    // TPC crossbars (router_crossbar_g_c_t)
-    for ( int t = 0; t < _num_tpcs; ++t ) {
-      int g = t / (_num_tpcs / _num_gpcs);
       name.str("");
-      name << "router_crossbar_" << g << "_";
-      if (_use_cpc) {
-        int c = t / (_num_tpcs / _num_cpcs);
-        name << c << "_";
-      }
-      name << "t";
-      id = _GetRouterIndex( layer, t, true );
-      _routers[id] = Router::NewRouter( config, this, name.str( ),
-              id, _sms_per_tpc + 1, _sms_per_tpc + 1);
-      _timed_modules.push_back(_routers[id]);
+      name << "router_" << "reply" << "_" << l << "_" << addr;
+      _routers[id + _size / 2] = Router::NewRouter(config, this, name.str(), id + _size / 2, top_ports, bottom_ports);
+      _timed_modules.push_back(_routers[id + _size / 2]);
     }
-    layer++;
-
-    // CPC crossbars (router_crossbar_g_c)
-    if (_use_cpc) {
-      for ( int c = 0; c < _num_cpcs; ++c ) {
-        int g = c / (_num_cpcs / _num_gpcs);
-        name.str("");
-        name << "router_crossbar_" << g << "_" << c;
-        id = _GetRouterIndex( layer, c, true );
-        _routers[id] = Router::NewRouter( config, this, name.str( ),
-                id, _tpcs_per_cpc + 1, _tpcs_per_cpc + 1);
-        _timed_modules.push_back(_routers[id]);
-      }
-      layer++;
-    }
-
-    // GPC crossbars (router_crossbar_g)
-    for ( int g = 0; g < _num_gpcs; ++g ) {
-      name.str("");
-      name << "router_crossbar_" << g;
-      id = _GetRouterIndex( layer, g, true );
-      _routers[id] = Router::NewRouter( config, this, name.str( ),
-              id, _xpcs_per_gpc, _xpcs_per_gpc);
-      _timed_modules.push_back(_routers[id]);
-    }
-  }
-  layer = 0;
-
-  //
-  // Connect Channels to Routers
-  //
-  // Injection & Ejection Channels
-  for ( int node = 0; node < _nodes; ++node ) {
-    int sm_router_id = (node < _num_sms) ? _GetRouterIndex( 0, node, false ) : -1;
-    int l2slice_router_id = (node >= _num_sms) ? _GetRouterIndex( 6, node - _num_sms, false ) : -1;
-
-    if( sm_router_id != -1 ) {
-      _routers[sm_router_id]->AddInputChannel( _inject[node], _inject_cred[node] );
-      _routers[sm_router_id]->AddOutputChannel( _eject[node], _eject_cred[node] );
-    } else if ( l2slice_router_id != -1 ) {
-      _routers[l2slice_router_id]->AddInputChannel( _inject[node], _inject_cred[node] );
-      _routers[l2slice_router_id]->AddOutputChannel( _eject[node], _eject_cred[node] );
-    }
-
-    latency = _WireLatency( layer, false );
-
-    _inject[node]->SetLatency( 1 );
-    _inject_cred[node]->SetLatency( 1 );
-    _inject[node]->SetBandwidth( 1 );
-    _inject_cred[node]->SetBandwidth( 1 );
-    
-    _eject[node]->SetLatency( 1 );
-    _eject_cred[node]->SetLatency( 1 );
-    _eject[node]->SetBandwidth( 1 );
-    _eject_cred[node]->SetBandwidth( 1 );
   }
   
-  // SM-to-L2 Network + SM-to-SM Network
-  int c_id = 0;
-  for ( int t = 0; t < _num_tpcs; ++t ) {
-    for ( int s = 0; s < _sms_per_tpc; ++s ) {
+  // STEP 2: Connect SM->TPC (injection) and TPC->SM (ejection) first
+#ifdef GPUNET_DEBUG
+  cout << "Connecting SM nodes..." << endl;
+#endif
 
-      int sm_id = t * _sms_per_tpc + s;
-      int lower = _GetRouterIndex( layer, sm_id, false );
-      int higher = _GetRouterIndex( layer + 1, t, false );
+  for (int addr = 0; addr < _total_units[0]; ++addr) {
+    for (int port = 0; port < _ratio[0]; ++port) {
+      id = _offsets[0] + addr;
+      c = addr * _ratio[0] + port;  // SM node index
 
-      latency = _WireLatency( layer, false );
-
-      // SM-to-TPC in the SM-to-L2 Network
-      // upward direction
-      _routers[lower]->AddOutputChannel( _chan[c_id], _chan_cred[c_id] );
-      _routers[higher]->AddInputChannel( _chan[c_id], _chan_cred[c_id] );
-
-      _chan[c_id]->SetLatency( latency );
-      _chan_cred[c_id]->SetLatency( latency );
-      _chan[c_id]->SetBandwidth( 1 );
-      _chan_cred[c_id]->SetBandwidth( 1 );
-
-      c_id++;
-
-      // downward direction
-      _routers[lower]->AddInputChannel( _chan[c_id], _chan_cred[c_id] );
-      _routers[higher]->AddOutputChannel( _chan[c_id], _chan_cred[c_id] );
+      // Request network: SM -> TPC (injection)
+      _routers[id]->AddInputChannel(_inject[c], _inject_cred[c]);
       
-      _chan[c_id]->SetLatency( latency );
-      _chan_cred[c_id]->SetLatency( latency );
-      _chan[c_id]->SetBandwidth( 1 );
-      _chan_cred[c_id]->SetBandwidth( 1 );
-
-      c_id++;
-      
-      // SM-to-TPC in the SM-to-SM Network
-      if (_use_dsmem) {
-        
-        int lower_d = _GetRouterIndex( layer, sm_id, true);
-        int higher_d = _GetRouterIndex( layer + 1, t, true );
-
-        latency = _WireLatency( layer, true );
-
-        // upward
-        _routers[lower_d]->AddOutputChannel( _chan[c_id], _chan_cred[c_id] );
-        _routers[higher_d]->AddInputChannel( _chan[c_id], _chan_cred[c_id] );
-
-        _chan[c_id]->SetLatency( latency );
-        _chan_cred[c_id]->SetLatency( latency );
-        _chan[c_id]->SetBandwidth( 1 );
-        _chan_cred[c_id]->SetBandwidth( 1 );
-
-        c_id++;
-
-        // downward
-        _routers[lower_d]->AddInputChannel( _chan[c_id], _chan_cred[c_id] );
-        _routers[higher_d]->AddOutputChannel( _chan[c_id], _chan_cred[c_id] );
-        
-        _chan[c_id]->SetLatency( latency );
-        _chan_cred[c_id]->SetLatency( latency );
-        _chan[c_id]->SetBandwidth( 1 );
-        _chan_cred[c_id]->SetBandwidth( 1 );
-
-        c_id++;
-      }    
+      // Reply network: TPC -> SM (ejection)
+      _routers[id + _size / 2]->AddOutputChannel(_eject[c], _eject_cred[c]);
     }
   }
-  layer++;
+  
+  // STEP 3: Connect L2->Crossbar (injection) and Crossbar->L2 (ejection)
+#ifdef GPUNET_DEBUG
+  cout << "Connecting L2 nodes..." << endl;
+#endif
 
-  // TPC-to-CPC 
-  if (_use_cpc) {
-    for ( int c = 0; c < _num_cpcs; ++c ) {
-      for ( int t = 0; t < _tpcs_per_cpc; ++t ) {
+  for (int addr = 0; addr < _total_units[_l - 1]; ++addr) {
+    for (int port = 0; port < _l2slice_p; ++port) {
+      id = _offsets[_l - 1] + addr;
+      c = _nodes_sm + addr * _l2slice_p + port;  // L2 node index
+      
+      // Request network: Crossbar -> L2 (ejection)
+      _routers[id]->AddOutputChannel(_eject[c], _eject_cred[c]);
+      
+      // Reply network: L2 -> Crossbar (injection)
+      _routers[id + _size / 2]->AddInputChannel(_inject[c], _inject_cred[c]);
+    }
+  }
+  
+  // STEP 4: Connect internal network channels
 
-        int tpc_id = c * _tpcs_per_cpc + t;
-        int lower = _GetRouterIndex( layer, tpc_id, false );
-        int higher = _GetRouterIndex( layer + 1 , c, false);
+#ifdef GPUNET_DEBUG
+  cout << "Connecting internal channels of request network..." << endl;
+#endif
+  
+  // 4.1: Connect Request Network internal channels
+  for (int l = 0; l < _l; ++l) {
+    for (int addr = 0; addr < _total_units[l]; ++addr) {
+      id = _offsets[l] + addr;
+      
+      // Connect bottom channels (from lower layer)
+      if (l > 0) {
+        for (int port = 0; port < _ratio[l]; ++port) {
+          c = _offsets[l - 1] + addr * _ratio[l] + port;
+          _routers[id]->AddInputChannel(_chan[c], _chan_cred[c]);
+        }
+      }
 
-        latency = _WireLatency( layer, false );
+      // Connect top channels (to higher layer)
+      if (l < _l - 1) {
+        c = _offsets[l] + addr;
+        _routers[id]->AddOutputChannel(_chan[c], _chan_cred[c]);
+      }
 
-        // TPC-to-CPC Network in the SM-to-L2 Network
-        // upward direction
-        _routers[lower]->AddOutputChannel( _chan[c_id], _chan_cred[c_id] );
-        _routers[higher]->AddInputChannel( _chan[c_id], _chan_cred[c_id] );
+      // Connect inter-partition channels for the last layer
+      if (l == _l - 1) {
+        for (int port = 0; port < (_p - 1); ++port) {
+          int src_partition = port;
+          if (src_partition >= addr) {
+            src_partition++;
+          }
 
-        _chan[c_id]->SetLatency( latency );
-        _chan_cred[c_id]->SetLatency( latency );
-        _chan[c_id]->SetBandwidth( _tpc_speedup );
-        _chan_cred[c_id]->SetBandwidth( _tpc_speedup );
-
-        c_id++;
-
-        // downward direction
-        _routers[lower]->AddInputChannel( _chan[c_id], _chan_cred[c_id] );
-        _routers[higher]->AddOutputChannel( _chan[c_id], _chan_cred[c_id] );
-        
-        _chan[c_id]->SetLatency( latency );
-        _chan_cred[c_id]->SetLatency( latency );
-        _chan[c_id]->SetBandwidth( _tpc_speedup );
-        _chan_cred[c_id]->SetBandwidth( _tpc_speedup );
-
-        c_id++;
-
-        // TPC-to-CPC in the SM-to-SM Network
-        if (_use_dsmem) {
-          int lower_d = _GetRouterIndex( layer, tpc_id, true);
-          int higher_d = _GetRouterIndex( layer + 1, c, true );
-
-          latency = _WireLatency( layer, true );
-
-          // upward
-          _routers[lower_d]->AddOutputChannel( _chan[c_id], _chan_cred[c_id] );
-          _routers[higher_d]->AddInputChannel( _chan[c_id], _chan_cred[c_id] );
-
-          _chan[c_id]->SetLatency( latency );
-          _chan_cred[c_id]->SetLatency( latency );
-          _chan[c_id]->SetBandwidth( _tpc_speedup );
-          _chan_cred[c_id]->SetBandwidth( _tpc_speedup );
-
-          c_id++;
-
-          // downward
-          _routers[lower_d]->AddInputChannel( _chan[c_id], _chan_cred[c_id] );
-          _routers[higher_d]->AddOutputChannel( _chan[c_id], _chan_cred[c_id] );
+          int src_outport = addr;
+          if (src_outport > src_partition) {
+            src_outport--;
+          }
           
-          _chan[c_id]->SetLatency( latency );
-          _chan_cred[c_id]->SetLatency( latency );
-          _chan[c_id]->SetBandwidth( _tpc_speedup );
-          _chan_cred[c_id]->SetBandwidth( _tpc_speedup );
+          // For each partition router, output and input channels
+          // are connected in sequential port order.
+          // Output channel
+          c = _offsets[l] + addr * (_p - 1) + port;
+          _routers[id]->AddOutputChannel(_chan[c], _chan_cred[c]);
 
-          c_id++;
+#ifdef GPUNET_DEBUG
+          cout << "Connecting inter-partition channel " << c
+               << " as an output chnanel of partition " << addr
+               << " through outport " << port << endl;
+#endif
+          
+          // Input channel
+          c = _offsets[l] + src_partition * (_p - 1) + src_outport;
+          _routers[id]->AddInputChannel(_chan[c], _chan_cred[c]);
+
+#ifdef GPUNET_DEBUG
+          cout << "Connecting inter-partition channel " << c
+               << " as an input channel from partition " << src_partition
+               << " using outport " << src_outport
+               << " to partition " << addr
+               << " through inport " << port << endl;
+#endif
+
         }
       }
     }
-    layer++;
   }
   
-  // CPC-to-GPC or TPC-to-GPC
-  for ( int g = 0; g < _num_gpcs; ++g ) {
-    for ( int x = 0; x < _xpcs_per_gpc; ++x ) {
+#ifdef GPUNET_DEBUG
+  cout << "Connecting internal channels of reply network..." << endl;
+#endif
 
-      int xpc_id = g * _xpcs_per_gpc + x;
-      int lower = _GetRouterIndex( layer, xpc_id, false );
-      int higher = _GetRouterIndex( layer + 1, g, false);
-
-      latency = _WireLatency( layer, false );
-
-      // CPC/TPC-to-GPC in the SM-to-L2 Network
-      // upward direction
-      _routers[lower]->AddOutputChannel( _chan[c_id], _chan_cred[c_id] );
-      _routers[higher]->AddInputChannel( _chan[c_id], _chan_cred[c_id] );
+  // 4.2: Connect Reply Network internal channels
+  for (int l = 0; l < _l; ++l) {
+    for (int addr = 0; addr < _total_units[l]; ++addr) {
+      id = _offsets[l] + addr + _size / 2;
       
-      _chan[c_id]->SetLatency( latency );
-      _chan_cred[c_id]->SetLatency( latency );
-      _chan[c_id]->SetBandwidth( _cpc_speedup );
-      _chan_cred[c_id]->SetBandwidth( _cpc_speedup );
-
-      c_id++;
-
-      // downward direction
-      _routers[lower]->AddInputChannel( _chan[c_id], _chan_cred[c_id] );
-      _routers[higher]->AddOutputChannel( _chan[c_id], _chan_cred[c_id] );
-      
-      _chan[c_id]->SetLatency( latency );
-      _chan_cred[c_id]->SetLatency( latency );
-      _chan[c_id]->SetBandwidth( _cpc_speedup );
-      _chan_cred[c_id]->SetBandwidth( _cpc_speedup );
-
-      c_id++;
-      // CPC/TPC-to-GPC in the SM-to-SM Network
-      if (_use_dsmem) {
-        int lower_d = _GetRouterIndex( layer, xpc_id, true);
-        int higher_d = _GetRouterIndex( layer + 1, g, true );
-
-        latency = _WireLatency( layer, true );
-
-        // upward
-        _routers[lower_d]->AddOutputChannel( _chan[c_id], _chan_cred[c_id] );
-        _routers[higher_d]->AddInputChannel( _chan[c_id], _chan_cred[c_id] );
-
-        _chan[c_id]->SetLatency( latency );
-        _chan_cred[c_id]->SetLatency( latency );
-        _chan[c_id]->SetBandwidth( _cpc_speedup );
-        _chan_cred[c_id]->SetBandwidth( _cpc_speedup );
-
-        c_id++;
-
-        // downward
-        _routers[lower_d]->AddInputChannel( _chan[c_id], _chan_cred[c_id] );
-        _routers[higher_d]->AddOutputChannel( _chan[c_id], _chan_cred[c_id] );
-        
-        _chan[c_id]->SetLatency( latency );
-        _chan_cred[c_id]->SetLatency( latency );
-        _chan[c_id]->SetBandwidth( _cpc_speedup );
-        _chan_cred[c_id]->SetBandwidth( _cpc_speedup );
-
-        c_id++;
+      // Connect bottom channels (to lower layer)
+      if (l > 0) {
+        for (int port = 0; port < _ratio[l]; ++port) {
+          c = _offsets[l - 1] + addr * _ratio[l] + port + _channels / 2;
+          _routers[id]->AddOutputChannel(_chan[c], _chan_cred[c]);
+        }
       }
-    }
-  }
-  layer++;
 
-  // GPC-to-Crossbar
-  for ( int p = 0; p < _num_partitions; ++p ) {
-    for ( int g = 0; g < _gpcs_per_partition; ++g ) {
-
-      int gpc_id = p * _gpcs_per_partition + g;
-      int lower = _GetRouterIndex( layer, gpc_id, false );
-      int higher = _GetRouterIndex( layer + 1, p, false);
-
-      latency = _WireLatency( layer, false );
-
-      // upward direction
-      _routers[lower]->AddOutputChannel( _chan[c_id], _chan_cred[c_id] );
-      _routers[higher]->AddInputChannel( _chan[c_id], _chan_cred[c_id] );
+      // Connect top channels (from higher layer)
+      if (l < _l - 1) {
+        c = _offsets[l] + addr + _channels / 2;
+        _routers[id]->AddInputChannel(_chan[c], _chan_cred[c]);
+      }
       
-      _chan[c_id]->SetLatency( latency );
-      _chan_cred[c_id]->SetLatency( latency );
-      _chan[c_id]->SetBandwidth( _gpc_speedup );
-      _chan_cred[c_id]->SetBandwidth( _gpc_speedup );
+      // Connect inter-partition channels for the last layer
+      if (l == _l - 1) {
+        for (int port = 0; port < (_p - 1); ++port) {
+          int src_partition = port;
+          if (src_partition >= addr) {
+            src_partition++;
+          }
 
-      c_id++;
+          int src_outport = addr;
+          if (src_outport > src_partition) {
+            src_outport--;
+          }
 
-      // downward direction
-      _routers[lower]->AddInputChannel( _chan[c_id], _chan_cred[c_id] );
-      _routers[higher]->AddOutputChannel( _chan[c_id], _chan_cred[c_id] );
-      
-      _chan[c_id]->SetLatency( latency );
-      _chan_cred[c_id]->SetLatency( latency );
-      _chan[c_id]->SetBandwidth( _gpc_speedup );
-      _chan_cred[c_id]->SetBandwidth( _gpc_speedup );
+          // For each partition router, output and input channels
+          // are connected in sequential port order.
+          // Output channel
+          c = _offsets[l] + addr * (_p - 1) + port + _channels / 2;
+          _routers[id]->AddOutputChannel(_chan[c], _chan_cred[c]);
+          
+#ifdef GPUNET_DEBUG
+          cout << "Connecting inter-partition channel " << c
+               << " as an output chnanel of partition " << addr
+               << " through outport " << port << endl;
+#endif
+          // Input channel
+          c = _offsets[l] + src_partition * (_p - 1) + src_outport + _channels / 2;
+          _routers[id]->AddInputChannel(_chan[c], _chan_cred[c]);
 
-      c_id++;
-    }
-  }
-  layer++;
+#ifdef GPUNET_DEBUG
+          cout << "Connecting inter-partition channel " << c
+               << " as an input channel from partition " << src_partition
+               << " using outport " << src_outport
+               << " to partition " << addr
+               << " through inport " << port << endl;
+#endif
 
-  // Crossbar-to-Crossbar
-  if (_use_partition && _num_partitions > 1) {
-    for ( int p1 = 0; p1 < _num_partitions; ++p1 ) {
-      for ( int p2 = p1 + 1; p2 < _num_partitions; ++p2 ) {
-        int p1_id = _GetRouterIndex( layer, p1, false );
-        int p2_id = _GetRouterIndex( layer, p2, false );
-
-        latency = _WireLatency( layer, false );
-
-        // p1 -> p2
-        _routers[p1_id]->AddOutputChannel( _chan[c_id], _chan_cred[c_id] );
-        _routers[p2_id]->AddInputChannel( _chan[c_id], _chan_cred[c_id] );
-        
-        _chan[c_id]->SetLatency( latency );
-        _chan_cred[c_id]->SetLatency( latency );
-        _chan[c_id]->SetBandwidth( _inter_partition_speedup );
-        _chan_cred[c_id]->SetBandwidth( _inter_partition_speedup );
-
-        c_id++;
-
-        // p2 -> p1
-        _routers[p1_id]->AddInputChannel( _chan[c_id], _chan_cred[c_id] );
-        _routers[p2_id]->AddOutputChannel( _chan[c_id], _chan_cred[c_id] );
-        
-        _chan[c_id]->SetLatency( latency );
-        _chan_cred[c_id]->SetLatency( latency );
-        _chan[c_id]->SetBandwidth( _inter_partition_speedup );
-        _chan_cred[c_id]->SetBandwidth( _inter_partition_speedup );
-
-        c_id++;
+        }
       }
     }
   }
 
-  // Crossbar-to-L2Group
-  for ( int p = 0; p < _num_partitions; ++p ) {
-    for ( int l2g = 0; l2g < _l2groups_per_partition; ++l2g ) {
-
-      int l2group_id = p * _l2groups_per_partition + l2g;
-      int lower = _GetRouterIndex( layer, p, false );
-      int higher = _GetRouterIndex( layer + 1, l2group_id, false);
-
-      latency = _WireLatency( layer, false );
-
-      // upward direction
-      _routers[lower]->AddOutputChannel( _chan[c_id], _chan_cred[c_id] );
-      _routers[higher]->AddInputChannel( _chan[c_id], _chan_cred[c_id] );
-      
-      _chan[c_id]->SetLatency( latency );
-      _chan_cred[c_id]->SetLatency( latency );
-      _chan[c_id]->SetBandwidth( _l2group_speedup );
-      _chan_cred[c_id]->SetBandwidth( _l2group_speedup );
-
-      c_id++;
-
-      // downward direction
-      _routers[lower]->AddInputChannel( _chan[c_id], _chan_cred[c_id] );
-      _routers[higher]->AddOutputChannel( _chan[c_id], _chan_cred[c_id] );
-      
-      _chan[c_id]->SetLatency( latency );
-      _chan_cred[c_id]->SetLatency( latency );
-      _chan[c_id]->SetBandwidth( _l2group_speedup );
-      _chan_cred[c_id]->SetBandwidth( _l2group_speedup );
-
-      c_id++;
-    }
-  }
-  layer++;
-
-
-  // L2Group-to-L2Slice
-  for ( int l2g = 0; l2g < _num_l2groups; ++l2g ) {
-    for ( int l2 = 0; l2 < _l2slices_per_l2group; ++l2 ) {
-
-      int l2slice_id = l2g * _l2slices_per_l2group + l2;
-      int lower = _GetRouterIndex( layer, l2g, false );
-      int higher = _GetRouterIndex( layer + 1, l2slice_id, false);
-
-      latency = _WireLatency( layer, false );
-
-      // upward direction
-      _routers[lower]->AddOutputChannel( _chan[c_id], _chan_cred[c_id] );
-      _routers[higher]->AddInputChannel( _chan[c_id], _chan_cred[c_id] );
-      
-      _chan[c_id]->SetLatency( latency );
-      _chan_cred[c_id]->SetLatency( latency );
-      _chan[c_id]->SetBandwidth( 1 );
-      _chan_cred[c_id]->SetBandwidth( 1 );
-
-      c_id++;
-
-      // downward direction
-      _routers[lower]->AddInputChannel( _chan[c_id], _chan_cred[c_id] );
-      _routers[higher]->AddOutputChannel( _chan[c_id], _chan_cred[c_id] );
-      
-      _chan[c_id]->SetLatency( latency );
-      _chan_cred[c_id]->SetLatency( latency );
-      _chan[c_id]->SetBandwidth( 1 );
-      _chan_cred[c_id]->SetBandwidth( 1 );
-
-      c_id++;
-    }
-  }
+  _SetupChannels();
 }
 
-int GPUNet::_GetRouterIndex( int layer, int id, bool dsmem )
+// Set up all channel properties
+void GPUNet::_SetupChannels()
 {
-  int index = 0;
-  // SM-to-L2 Network
-  if (!dsmem) {
-    if ( layer == 0 ) return id;          // SM
-    index += _num_sms;
-    if ( layer == 1 ) return index + id;  // TPC
-    index += _num_tpcs;
-    if ( layer == 2 ) return index + id;  // CPC
-    index += _num_cpcs;
-    if ( layer == 3 ) return index + id;  // GPC
-    index += _num_gpcs;
-    if ( layer == 4 ) return index + id;  // Crossbars
-    index += _num_partitions;
-    if ( layer == 5 ) return index + id;  // L2 Groups
-    index += _num_l2groups;
-    if ( layer == 6 ) return index + id;  // L2 Slices
+  cout << "Setting up channel properties..." << endl;
+  
+  // Injection and Ejection channels
+  for (int i = 0; i < _nodes_sm; i++) {
+    _SetChannelProperties(_inject[i], _inject_cred[i], 0);
+    _SetChannelProperties(_eject[i], _eject_cred[i], 0);
+  }
+
+  for (int i = _nodes_sm; i < _nodes; i++) {
+    _SetChannelProperties(_inject[i], _inject_cred[i], _l);
+    _SetChannelProperties(_eject[i], _eject_cred[i], _l);
+  }
+  
+  for (int l = 1; l < _l; l++) {
+    int start = _offsets[l - 1];
+    int end = _offsets[l];
+    
+    // TPC <-> CPC, CPC <-> GPC, GPC <-> Crossbar channels
+    for (int c = start; c < end; c++) {
+      _SetChannelProperties(_chan[c], _chan_cred[c], l);
+      _SetChannelProperties(_chan[c + _channels / 2], _chan_cred[c + _channels / 2], l);
+    }
+  }
+  
+  // interpartition channels for the last layer
+  if (_partition) {
+    int p_start = _offsets[_l - 1];
+    int p_end = _offsets[_l - 1] + _p * (_p - 1);
+    for (int c = p_start; c < p_end; c++) {
+      _SetChannelProperties(_chan[c], _chan_cred[c], _l - 1, true);
+      _SetChannelProperties(_chan[c + _channels / 2], _chan_cred[c + _channels / 2], _l - 1, true);
+    }
+  }
+  
+  
+  cout << "All channel properties set" << endl;
+}
+
+// Set channel latency and bandwidth based on layer properties
+void GPUNet::_SetChannelProperties(FlitChannel* channel, CreditChannel* credit_channel, int layer, bool is_inter_partition)
+{
+  int latency = _GetWireLatency(layer, is_inter_partition);
+  int bandwidth = _GetChannelBandwidth(layer, is_inter_partition);
+  
+  channel->SetLatency(latency);
+  channel->SetBandwidth(bandwidth);
+  credit_channel->SetLatency(latency);
+  credit_channel->SetBandwidth(bandwidth);
+}
+
+int GPUNet::_GetWireLatency(int layer, bool is_inter_partition) const
+{
+  // Base latency increases with layer depth
+  int latency = 1 + layer;
+  
+  // Add additional latency for inter-partition connections
+  if (is_inter_partition) {
+    latency += 1;
+  }
+  
+  return latency;
+}
+
+int GPUNet::_GetChannelBandwidth(int layer, bool is_inter_partition) const
+{
+  return is_inter_partition ? _inter_partition_speedup : _speedups[layer];
+}
+
+int GPUNet::_FloorplanLatency(int src_x, int src_y, int dst_x, int dst_y) const
+{
+  return abs(src_x - dst_x) + abs(src_y - dst_y);
+}
+
+
+void GPUNet::RegisterRoutingFunctions()
+{
+  gRoutingFunctionMap["hierarchical_gpunet"] = &hierarchical_gpunet;
+  // gRoutingFunctionMap["direct_fullyconnected"] = &direct_fullyconnected;
+
+}
+
+void hierarchical_gpunet(const Router *r, const Flit *f, int in_channel, OutputSet *outputs, bool inject)
+{
+  int vcBegin = 0, vcEnd = gNumVCs - 1;
+  if (f->type == Flit::READ_REQUEST || f->type == Flit::READ_REPLY) {
+    vcBegin = 0;
+    vcEnd = gNumVCs / 2 - 1;
+  } else if (f->type == Flit::WRITE_REQUEST || f->type == Flit::WRITE_REPLY) {
+    vcBegin = gNumVCs / 2;
+    vcEnd = gNumVCs - 1;
+  }
+  assert(((f->vc >= vcBegin) && (f->vc <= vcEnd)) || (inject && (f->vc < 0)));
+
+  int out_port;
+  
+  if (inject) {
+    // injection can use all VCs
+    outputs->AddRange(-1, vcBegin, vcEnd);
+    return;
+  }
+
+  int src = f->src;
+  int dest = f->dest;
+  int hops = f->hops;
+
+  // cout << "router: " << r->GetID() 
+  //      << ", time: " << GetSimTime() << endl;
+
+  // cout << "Routing flit: " << f->id
+  //      <<  " src: " << src 
+  //      << ", dest: " << dest 
+  //      << ", hops: " << f->hops << endl;
+
+  // # of SMs and L2 Slices per partition
+  int sm = gX;
+  for (int i = 0; i < gN; ++i) {
+    sm *= gU[i];
+  }
+  int sm_p = sm / gX; // SMs per partition
+  int l2slice = gNodes - sm;
+  int l2slice_p = l2slice / gX; // L2 slices per partition
+
+  assert((src < sm && dest >= sm) || (src >= sm && dest < sm));
+  bool is_request = dest > src;
+
+  int src_partition = is_request ? (src / sm_p) : ((src - sm) / l2slice_p);
+  int dest_partition = is_request ? ((dest - sm) / l2slice_p) : (dest / sm_p);
+  bool is_remote = (dest_partition != src_partition);
+
+  // if remote access is required, add one additional hop,
+  // in the case of fully-connected partitioned network
+  int total_hops = is_remote ? (gN + 1) : gN;
+  int cur_layer = is_request ? hops : (total_hops - hops - 1);
+
+  if (is_request) {
+    // request network
+    if (cur_layer < gN - 1) {
+      out_port = 0;
+    } else {
+      // partition layer
+      assert(r->NumOutputs() == l2slice_p + (gX - 1));
+
+      if (is_remote && (cur_layer == total_hops - 2)) {
+        // inter-partition communication
+        int dest_port = (dest_partition > src_partition) ? (dest_partition - 1) : dest_partition;
+        out_port = l2slice_p + dest_port;
+      } else {
+        // intra-partition communication or already crossed inter-partition
+        out_port = (dest - sm) % l2slice_p;
+      }
+    }
   } else {
-  // SM-to-SM network
-    if ( layer == 0 ) return id;          // SM
-    index += _num_sm_to_l2;
-    if ( layer == 1 ) return index + id;  // Crossbars in TPCs
-    index += _num_tpcs;
-    if ( layer == 2 ) return index + id;  // Crossbars in CPCs
-    index += _num_cpcs;
-    if ( layer == 3 ) return index + id;  // Crossbars in GPCs
+    // reply network
+    if (cur_layer < gN - 1) {
+      int sm_group = 1;
+      for (int i = 0; i < cur_layer; ++i) {
+        sm_group *= gU[i];
+      }
+      out_port = (dest % (sm_group * gU[cur_layer])) / sm_group;
+    } else {
+      // partition layer
+      assert(r->NumInputs() == l2slice_p + (gX - 1));
+
+      if (is_remote && (cur_layer == total_hops - 1)) {
+        // inter-partition communication
+        int dest_port = (dest_partition > src_partition) ? (dest_partition - 1) : dest_partition; 
+        out_port = gU[gN - 1] + dest_port;
+      } else {
+        // intra-partition communication or already crossed inter-partition
+        out_port = (dest % sm_p) / (sm_p / gU[gN - 1]);
+      }
+    }
   }
 
-  return -1;
+  if (f->watch) {
+    *gWatchOut << GetSimTime() << " | " << r->FullName() << " | "
+               << "Adding VC range ["
+               << vcBegin << ","
+               << vcEnd << "]"
+               << " at output port " << out_port
+               << " for flit " << f->id
+               << " (input port " << in_channel
+               << ", destination " << f->dest << ")"
+               << "." << endl;
+  }
+
+  outputs->Clear( );
+
+  outputs->AddRange( out_port, vcBegin, vcEnd );
 }
-
-int GPUNet::_WireLatency(int layer, bool dsmem)
-{
-  // latency calculation according to the hierarchy
-  int base_latency = 1;
-  if ( layer == 0 ) return base_latency;
-  base_latency += 2;
-  if ( layer == 1 ) return base_latency;
-  base_latency += 4;
-  if ( layer == 2 ) return base_latency;
-  base_latency += 6;
-  if ( layer == 3 ) return base_latency;
-  base_latency += 8;
-  if ( layer == 4 ) return base_latency;
-  base_latency += 10;
-  if ( layer == 5 ) return base_latency;
-  base_latency += _FloorplanLatency( 0, 0, 0, 0);
-  if ( layer == 6 ) return base_latency;  // L2 Slices
-
-  return -1;
-}
-
-int GPUNet::_FloorplanLatency( int src_x, int src_y, int dst_x, int dst_y)
-{
-  return abs( src_x - dst_x ) + abs( src_y - dst_y );
-}
-

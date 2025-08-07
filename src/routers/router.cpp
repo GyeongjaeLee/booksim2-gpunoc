@@ -41,6 +41,7 @@
 #include "booksim.hpp"
 #include <iostream>
 #include <cassert>
+#include <vector>
 #include "router.hpp"
 
 //////////////////Sub router types//////////////////////
@@ -56,10 +57,10 @@ int const Router::STALL_BUFFER_RESERVED = -5;
 int const Router::STALL_CROSSBAR_CONFLICT = -6;
 
 Router::Router( const Configuration& config,
-		Module *parent, const string & name, int id,
-		int inputs, int outputs ) :
-TimedModule( parent, name ), _id( id ), _inputs( inputs ), _outputs( outputs ),
-   _partial_internal_cycles(0.0)
+		Module *parent, const string & name, int id, int inputs, int outputs,
+     vector<int> const & input_bandwidths, vector<int> const & output_bandwidths ) :
+TimedModule( parent, name ), _id( id ), _inputs( inputs ), _outputs( outputs ), _partial_internal_cycles(0.0),
+   _input_bandwidths( input_bandwidths ), _output_bandwidths( output_bandwidths )
 {
   _crossbar_delay   = ( config.GetInt( "st_prepare_delay" ) + 
 			config.GetInt( "st_final_delay" ) );
@@ -68,6 +69,18 @@ TimedModule( parent, name ), _id( id ), _inputs( inputs ), _outputs( outputs ),
   _output_speedup   = config.GetInt( "output_speedup" );
   _internal_speedup = config.GetFloat( "internal_speedup" );
   _classes          = config.GetInt( "classes" );
+
+  _input_bandwidths = input_bandwidths;
+  if (_input_bandwidths.empty()) {
+    _input_bandwidths.push_back(1);
+  }
+  _input_bandwidths.resize(_inputs, _input_bandwidths.back());
+  
+  _output_bandwidths = output_bandwidths;
+  if (_output_bandwidths.empty()) {
+    _output_bandwidths.push_back(1);
+  }
+  _output_bandwidths.resize(_outputs, _output_bandwidths.back());
 
 #ifdef TRACK_FLOWS
   _received_flits.resize(_classes, vector<int>(_inputs, 0));
@@ -96,7 +109,7 @@ void Router::AddInputChannel( FlitChannel *channel, CreditChannel *backchannel )
 
 void Router::AddOutputChannel( FlitChannel *channel, CreditChannel *backchannel )
 {
-  _output_channels.push_back( channel );
+  _output_channels.push_back( channel ); 
   _output_credits.push_back( backchannel );
   _channel_faults.push_back( false );
   channel->SetSource( this, _output_channels.size() - 1 ) ;
@@ -127,13 +140,13 @@ bool Router::IsFaultyOutput( int c ) const
 
 /*Router constructor*/
 Router *Router::NewRouter( const Configuration& config,
-			   Module *parent, const string & name, int id,
-			   int inputs, int outputs )
+			   Module *parent, const string & name, int id, int inputs, int outputs,
+          vector<int> const & input_bandwidths, vector<int> const & output_bandwidths )
 {
   const string type = config.GetStr( "router" );
   Router *r = NULL;
   if ( type == "iq" ) {
-    r = new IQRouter( config, parent, name, id, inputs, outputs );
+    r = new IQRouter( config, parent, name, id, inputs, outputs, input_bandwidths, output_bandwidths );
   } else if ( type == "event" ) {
     r = new EventRouter( config, parent, name, id, inputs, outputs );
   } else if ( type == "chaos" ) {

@@ -65,4 +65,14 @@ public:
   virtual bool test(int source);
 };
 
+
+class GPUInjectionProcess : public InjectionProcess {
+private:
+  int _nodes_sm;
+  
+public:
+  GPUInjectionProcess(int nodes, double rate, const Configuration* const config);
+  virtual bool test(int source);
+};
+
 #endif 

@@ -29,7 +29,6 @@
 #define _ROUTER_HPP_
 
 #include <string>
-#include <vector>
 
 #include "timed_module.hpp"
 #include "flit.hpp"
@@ -60,6 +59,9 @@ protected:
   int _input_speedup;
   int _output_speedup;
   
+  vector<int> _input_bandwidths;
+  vector<int> _output_bandwidths;
+
   double _internal_speedup;
   double _partial_internal_cycles;
 
@@ -92,12 +94,12 @@ protected:
 
 public:
   Router( const Configuration& config,
-	  Module *parent, const string & name, int id,
-	  int inputs, int outputs );
+	  Module *parent, const string & name, int id, int inputs, int outputs,
+    vector<int> const & input_bandwidths = {}, vector<int> const & output_bandwidths = {} );
 
   static Router *NewRouter( const Configuration& config,
-			    Module *parent, const string & name, int id,
-			    int inputs, int outputs );
+			    Module *parent, const string & name, int id, int inputs, int outputs,
+          vector<int> const & input_bandwidths = {}, vector<int> const & output_bandwidths = {} );
 
   virtual void AddInputChannel( FlitChannel *channel, CreditChannel *backchannel );
   virtual void AddOutputChannel( FlitChannel *channel, CreditChannel *backchannel );
@@ -119,7 +121,8 @@ public:
   bool IsFaultyOutput( int c ) const;
 
   inline int GetID( ) const {return _id;}
-
+  inline vector<int> const & GetInputBandwidths( ) const {return _input_bandwidths;}
+  inline vector<int> const & GetOutputBandwidths( ) const {return _output_bandwidths;}
 
   virtual int GetUsedCredit(int o) const = 0;
   virtual int GetBufferOccupancy(int i) const = 0;

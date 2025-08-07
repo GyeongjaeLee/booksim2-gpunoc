@@ -1,67 +1,64 @@
-
 #ifndef _GPUNET_HPP_
 #define _GPUNET_HPP_
 #include <cassert>
 #include <vector>
+
 #include "network.hpp"
+#include "routefunc.hpp"
 
 class GPUNet : public Network {
+  
+  // # of layer that requests traverse to get partition crossbars
+  // ex) (_l == 3): SM->TPC->GPC->Crossbar, (_l == 4): SM->TPC->CPC->GPC->Crossbar
+  int _l;
 
-  int _n;
-  int _k;
-
-  bool _use_partition;
-  bool _use_cpc;
-  bool _use_dsmem;
-
-  int _num_sms;
-  int _num_tpcs;
-  int _num_cpcs;
-  int _num_gpcs;
-  int _num_partitions;
-  int _num_l2groups;
-  int _num_l2slices;
-
-  int _tpc_speedup;
-  int _cpc_speedup;
-  int _gpc_speedup;
+  int _nodes_sm;
+  int _nodes_l2slice;
+  int _l2slice_p;
+  
+  // # of lower-level units connected to a single higher-level module.
+  // l =      0,             1,      ...,     _l-1  
+  // ex) [SM per TPCs, TPCs per XPC, ..., GPCs per Crossbars]
+  vector<int> _ratio;
+  // ex) [TPCs, ..., GPCs, Crossbars]
+  vector<int> _total_units;
+  // _offsets for Router and Channel id of each layer
+  vector<int> _offsets;
+  // l =     0,    ...,   _l-2,     _l-1                 _l
+  // ex) [SM->TPC, ..., CPC->GPC, GPC->Crossbar, Crossbar->L2Slice]
+  // speedup for SM->TPC should always be 1 (channel width, not bandwidth?)
+  vector<int> _speedups;
+    
+  // A100, H100 supports partitioned GPUNet, not supported in V100
+  bool _partition;
+  // # of partitions, _p = 1 for non-partitioned GPUNet
+  int _p;
   int _inter_partition_speedup;
-  int _l2group_speedup;
 
-  int _sms_per_tpc;
-  int _tpcs_per_cpc;
-  // if _use_cpc=1, cpcs/gpc, otherwise, tpcs/gpc
-  int _xpcs_per_gpc;
-  int _gpcs_per_partition;
-  int _l2groups_per_partition;
-  int _l2slices_per_l2group;
-
-
-
-  int _num_sm_to_l2;
-  int _num_sm_to_sm;
-
-  int _channels_sm_to_l2;
-  int _channels_sm_to_sm;
-
-
+  
 
   vector<pair<int, int> > _l2slice_coords;
 
-  void _ComputeSize( const Configuration& config );
-  void _BuildNet( const Configuration& config );
+  void _ComputeSize(const Configuration& config);
+  void _BuildNet(const Configuration& config);
 
-  int _GetRouterIndex( int layer, int id, bool dsmem );
-
-  int _WireLatency( int layer, bool dsmem );
-  int _FloorplanLatency( int src_x, int src_y, int dst_x, int dst_y );
-  int _ChannelBandwidth( int layer, bool dsmem );
+  // Set latency and bandwidth for a channel based on its layer
+  void _SetupChannels();
+  void _SetChannelProperties(FlitChannel* channel, CreditChannel* credit_channel,
+                   int layer, bool is_inter_partition = false);
+  int _GetWireLatency(int layer, bool is_inter_partition = false) const;
+  int _GetChannelBandwidth(int layer, bool is_inter_partition = false) const;
+  
+  int _WireLatency(int l) const;
+  int _FloorplanLatency(int src_x, int src_y, int dst_x, int dst_y) const;
 
 public:
 
   GPUNet( const Configuration& config, const string & name );
-  static void RegisterRoutingFunctions() ;
-
+  static void RegisterRoutingFunctions();
 };
+
+void hierarchical_gpunet( const Router *r, const Flit *f, int in_channel,
+                   OutputSet *outputs, bool inject );
 
 #endif

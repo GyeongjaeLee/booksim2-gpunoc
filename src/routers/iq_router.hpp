@@ -67,7 +67,7 @@ class IQRouter : public Router {
   int _vc_alloc_delay;
   int _sw_alloc_delay;
   
-  // change to multimap to support multiple flits transfer
+  // support multiple flits transfer
   multimap<int, Flit *> _in_queue_flits;
 
   deque<pair<int, pair<Credit *, int> > > _proc_credits;
@@ -79,7 +79,7 @@ class IQRouter : public Router {
 
   deque<pair<int, pair<Flit *, pair<int, int> > > > _crossbar_flits;
 
-  multimap<int, Credit *> _out_queue_credits;
+  map<int, Credit *> _out_queue_credits;
 
   vector<Buffer *> _buf;
   vector<BufferState *> _next_buf;
@@ -152,8 +152,8 @@ class IQRouter : public Router {
 public:
 
   IQRouter( Configuration const & config,
-	    Module *parent, string const & name, int id,
-	    int inputs, int outputs );
+	    Module *parent, string const & name, int id, int inputs, int outputs,
+      vector<int> const & input_bandwidths = {}, vector<int> const & output_bandwidths = {} );
   
   virtual ~IQRouter( );
   

@@ -178,7 +178,7 @@ class BufferState : public Module {
 public:
 
   BufferState( const Configuration& config, 
-	       Module *parent, const string& name );
+	       Module *parent, const string& name, int bandwidth = 1 );
 
   ~BufferState();
 

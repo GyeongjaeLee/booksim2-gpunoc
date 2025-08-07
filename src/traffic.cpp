@@ -191,7 +191,10 @@ TrafficPattern * TrafficPattern::New(string const & pattern, int nodes,
       rates.resize(hotspots.size(), 1);
     }
     result = new HotSpotTrafficPattern(nodes, hotspots, rates);
-  } else {
+  } else if(pattern_name == "gpu") {
+    result = new GPUTrafficPattern(nodes, config);
+  }
+    else {
     cout << "Error: Unknown traffic pattern: " << pattern << endl;
     exit(-1);
   }
@@ -523,4 +526,22 @@ int HotSpotTrafficPattern::dest(int source)
   }
   assert(_rates.back() > pct);
   return _hotspots.back();
+}
+
+// GPU Traffic Pattern: SM nodes send requests to L2 slices only
+GPUTrafficPattern::GPUTrafficPattern(int nodes, Configuration const * const config)
+   : TrafficPattern(nodes)
+{
+  _nodes_sm = config->GetInt("sm");
+  _nodes_l2slice = config->GetInt("l2slice");
+}
+
+int GPUTrafficPattern::dest(int source)
+{
+    // If source is an L2 slice, no requests are generated
+    if (source >= _nodes_sm) {
+      return -1; // Special value to indicate no request
+    }
+    
+    return _nodes_sm + RandomInt(_nodes - _nodes_sm - 1);
 }

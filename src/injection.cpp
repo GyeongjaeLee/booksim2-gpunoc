@@ -125,6 +125,8 @@ InjectionProcess * InjectionProcess::New(string const & inject, int nodes,
       }
     }
     result = new OnOffInjectionProcess(nodes, load, alpha, beta, r1, initial);
+  } else if(process_name == "gpu_bernoulli") {
+    result = new GPUInjectionProcess(nodes, load, config);
   } else {
     cout << "Invalid injection process: " << inject << endl;
     exit(-1);
@@ -187,4 +189,23 @@ bool OnOffInjectionProcess::test(int source)
 
   // generate packet
   return _state[source] && (RandomFloat() < _r1);
+}
+
+//=============================================================
+
+GPUInjectionProcess::GPUInjectionProcess(int nodes, double rate, 
+               const Configuration* const config)
+  : InjectionProcess(nodes, rate)
+{
+  _nodes_sm = config->GetInt("sm");
+}
+
+bool GPUInjectionProcess::test(int source)
+{
+  if(source >= _nodes_sm) {
+    return false; // Only SM nodes can inject packets
+  }
+
+  assert((source >= 0) && (source < _nodes_sm));
+  return (RandomFloat() < _rate);
 }

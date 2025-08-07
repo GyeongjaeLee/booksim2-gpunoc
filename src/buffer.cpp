@@ -31,8 +31,8 @@
 #include "booksim.hpp"
 #include "buffer.hpp"
 
-Buffer::Buffer( const Configuration& config, int outputs, 
-		Module *parent, const string& name ) :
+Buffer::Buffer( const Configuration& config, int outputs,
+		Module *parent, const string& name, int bandwidth )  :
 Module( parent, name ), _occupancy(0)
 {
   int num_vcs = config.GetInt( "num_vcs" );

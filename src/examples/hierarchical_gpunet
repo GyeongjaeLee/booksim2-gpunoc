@@ -1,0 +1,43 @@
+// Topology
+topology = gpunet;
+l = 1;
+sm = 144;
+l2slice = 80;
+units = {2,3,3,4};
+partition = 1;
+
+// Activate Read/Write
+use_read_write = 1;
+
+write_fraction = 0.5;
+read_request_size = 1;
+read_reply_size = 1;
+write_request_size = 1;
+write_reply_size = 1;
+
+// Routing
+routing_function = hierarchical;
+router = iq;
+vc_allocator = separable_input_first;
+sw_allocator = separable_input_first;
+alloc_iters = 1;
+
+input_speedup = 1;
+output_speedup = 1;
+internal_speedup = 1.0;
+speedups = {1};
+inter_partition_speedup = 0;
+
+vc_alloc_delay = 1;
+sw_alloc_delay = 1;
+routing_delay = 0;
+credit_delay = 1;
+
+// Flow control
+num_vcs = 8;
+vc_buf_size = 16;
+
+// Traffic
+traffic = gpu;
+injection_process = gpu_bernoulli;
+injection_rate = 0.1;
